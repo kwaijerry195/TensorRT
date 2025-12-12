@@ -37,6 +37,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -44,6 +45,43 @@ using namespace nvinfer1;
 using samplesCommon::SampleUniquePtr;
 
 const std::string gSampleName = "TensorRT.sample_graph";
+const double gEps = 0.001;
+
+//! \brief BufferPool preallocate buffers to boost performance
+//! we don't bind buffer to nvinfer1 context, because buffers are shared with io modules
+class BufferPool
+{
+public:
+    static constexpr size_t kCapacity = 2;
+
+public:
+    BufferPool(std::shared_ptr<nvinfer1::ICudaEngine> engine)
+    {
+        for (int i = 0; i < kCapacity; ++i)
+        {
+            mBuffers.emplace_back(std::make_shared<samplesCommon::BufferManager>(engine));
+        }
+    }
+
+    std::shared_ptr<samplesCommon::BufferManager> Get()
+    {
+        std::shared_ptr<samplesCommon::BufferManager> buffer = nullptr;
+        if (!mBuffers.empty())
+        {
+            buffer = mBuffers.front();
+            mBuffers.pop_front();
+        }
+        return std::move(buffer);
+    }
+
+    void Put(std::shared_ptr<samplesCommon::BufferManager> buffer)
+    {
+        mBuffers.push_back(std::move(buffer));
+    }
+
+private:
+    std::deque<std::shared_ptr<samplesCommon::BufferManager>> mBuffers;
+};
 
 //! \brief  The SampleGraph class implements the ONNX MNIST sample
 //!
@@ -89,12 +127,12 @@ private:
     //!
     //! \brief Reads the input  and stores the result in a managed buffer
     //!
-    bool processInput(const samplesCommon::BufferManager& buffers);
+    bool processInput(const samplesCommon::BufferManager& buffers, int idx);
 
     //!
     //! \brief Classifies digits and verify result
     //!
-    bool verifyOutput(const samplesCommon::BufferManager& buffers);
+    bool verifyOutput(const samplesCommon::BufferManager& buffers, int idx);
 
     void printMatrix(float* host_data, size_t M, size_t N)
     {
@@ -263,7 +301,7 @@ bool SampleGraph::constructNetwork(SampleUniquePtr<nvinfer1::IBuilder>& builder,
 bool SampleGraph::infer()
 {
     // Create RAII buffer manager object
-    samplesCommon::BufferManager buffers(mEngine);
+    BufferPool buffers(mEngine);
 
     auto context = SampleUniquePtr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
     if (!context)
@@ -271,35 +309,45 @@ bool SampleGraph::infer()
         return false;
     }
 
-    for (int32_t i = 0, e = mEngine->getNbIOTensors(); i < e; i++)
-    {
-        auto const name = mEngine->getIOTensorName(i);
-        context->setTensorAddress(name, buffers.getDeviceBuffer(name));
-    }
-
-    // Read the input data into the managed buffers
+    // prepare input data
     ASSERT(mParams.inputTensorNames.size() == 1);
-    if (!processInput(buffers))
+    for (int32_t i = 0; i < BufferPool::kCapacity; ++i)
     {
-        return false;
+        auto buffer = buffers.Get();
+        ASSERT(buffer != nullptr);
+        if (!processInput(*buffer, i))
+        {
+            return false;
+        }
+        // Memcpy from host input buffers to device input buffers
+        buffer->copyInputToDevice();
+        buffers.Put(buffer);
     }
-
-    // Memcpy from host input buffers to device input buffers
-    buffers.copyInputToDevice();
-
-    bool status = context->executeV2(buffers.getDeviceBindings().data());
-    if (!status)
+    // run infer
+    for (int32_t i = 0; i < BufferPool::kCapacity; ++i)
     {
-        return false;
-    }
+        auto buffer = buffers.Get();
+        ASSERT(buffer != nullptr);
+        for (int32_t b = 0, e = mEngine->getNbIOTensors(); b < e; b++)
+        {
+            auto const name = mEngine->getIOTensorName(b);
+            context->setTensorAddress(name, buffer->getDeviceBuffer(name));
+        }
+        bool status = context->executeV2(buffer->getDeviceBindings().data());
+        if (!status)
+        {
+            return false;
+        }
 
-    // Memcpy from device output buffers to host output buffers
-    buffers.copyOutputToHost();
+        // Memcpy from device output buffers to host output buffers
+        buffer->copyOutputToHost();
 
-    // Verify results
-    if (!verifyOutput(buffers))
-    {
-        return false;
+        // Verify results
+        if (!verifyOutput(*buffer, i))
+        {
+            return false;
+        }
+        buffers.Put(std::move(buffer));
     }
 
     return true;
@@ -308,22 +356,21 @@ bool SampleGraph::infer()
 //!
 //! \brief Reads the input and stores the result in a managed buffer
 //!
-bool SampleGraph::processInput(const samplesCommon::BufferManager& buffers)
+bool SampleGraph::processInput(const samplesCommon::BufferManager& buffers, int idx)
 {
     const int inputM = mInputDims.d[0];
     const int inputK = mInputDims.d[1];
 
     float* hostDataBuffer = static_cast<float*>(buffers.getHostBuffer(mParams.inputTensorNames[0]));
-    int idx = 0;
+    size_t v = idx, pos = 0;
     for (int i = 0; i < inputM; i++)
     {
         for (int j = 0; j < inputK; j++)
         {
-            hostDataBuffer[idx] = idx;
-            ++idx;
+            hostDataBuffer[pos++] = v++;
         }
     }
-    sample::gLogInfo << "Input: ";
+    sample::gLogInfo << "Input [" << idx << "]: ";
     printMatrix(hostDataBuffer, inputM, inputK);
     sample::gLogInfo << std::endl;
     return true;
@@ -334,14 +381,29 @@ bool SampleGraph::processInput(const samplesCommon::BufferManager& buffers)
 //!
 //! \return whether the classification output matches expectations
 //!
-bool SampleGraph::verifyOutput(const samplesCommon::BufferManager& buffers)
+bool SampleGraph::verifyOutput(const samplesCommon::BufferManager& buffers, int idx)
 {
     const int outputM = mOutputDims.d[0];
     const int outputN = mOutputDims.d[1];
+    float* input = static_cast<float*>(buffers.getHostBuffer(mParams.inputTensorNames[0]));
     float* output = static_cast<float*>(buffers.getHostBuffer(mParams.outputTensorNames[0]));
-    sample::gLogInfo << "Output: ";
+    sample::gLogInfo << "Output[" << idx << "]: ";
     printMatrix(output, outputM, outputN);
     sample::gLogInfo << std::endl;
+    int pos = 0;
+    for (int i = 0; i < outputM; ++i)
+    {
+        for (int j = 0; j < outputN; ++j)
+        {
+            if (abs(input[pos] - output[pos]) > gEps)
+            {
+                sample::gLogError << "Verify failed: idx = " << idx << ", (i, j) = (" << i << ", " << j
+                                  << "), output vs expected = " << output[pos] << " vs " << input[pos] << std::endl;
+                return false;
+            }
+            ++pos;
+        }
+    }
     return true;
 }
 
