@@ -98,6 +98,7 @@ set(OPENSOURCE_SAMPLES_LIST
     sampleCharRNN
     sampleDynamicReshape
     sampleEditableTimingCache
+    sampleGraph
     sampleINT8API
     sampleIOFormats
     sampleNamedDimensions
