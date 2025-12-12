@@ -7,7 +7,7 @@ TensorRT uses cuda stream capture apis to run in graph mode. However, when i/o b
 ## How to run this demo?
 1. Compile the sample by following build instructions in [TensorRT README](https://github.com/NVIDIA/TensorRT/).
 
-2.  Run the sample to build and run the MNIST engine from the ONNX model.
+2.  Run the sample to build and run the demo.
 	```
     path/to/sample_graph  --datadir=path/to/this/source/directory
 	```
