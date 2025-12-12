@@ -43,16 +43,16 @@
 using namespace nvinfer1;
 using samplesCommon::SampleUniquePtr;
 
-const std::string gSampleName = "TensorRT.sample_onnx_mnist";
+const std::string gSampleName = "TensorRT.sample_graph";
 
-//! \brief  The SampleOnnxMNIST class implements the ONNX MNIST sample
+//! \brief  The SampleGraph class implements the ONNX MNIST sample
 //!
 //! \details It creates the network using an ONNX model
 //!
-class SampleOnnxMNIST
+class SampleGraph
 {
 public:
-    SampleOnnxMNIST(const samplesCommon::OnnxSampleParams& params)
+    SampleGraph(const samplesCommon::OnnxSampleParams& params)
         : mParams(params)
         , mRuntime(nullptr)
         , mEngine(nullptr)
@@ -95,6 +95,31 @@ private:
     //! \brief Classifies digits and verify result
     //!
     bool verifyOutput(const samplesCommon::BufferManager& buffers);
+
+    void printMatrix(float* host_data, size_t M, size_t N)
+    {
+        sample::gLogInfo << "[";
+        size_t idx = 0;
+        for (int i = 0; i < M; i++)
+        {
+            if (i)
+            {
+                sample::gLogInfo << ", ";
+            }
+            sample::gLogInfo << "[";
+            for (int j = 0; j < N; j++)
+            {
+                if (j)
+                {
+                    sample::gLogInfo << ", ";
+                }
+                sample::gLogInfo << host_data[idx];
+                ++idx;
+            }
+            sample::gLogInfo << "]";
+        }
+        sample::gLogInfo << "]";
+    }
 };
 
 //!
@@ -105,7 +130,7 @@ private:
 //!
 //! \return true if the engine was created successfully and false otherwise
 //!
-bool SampleOnnxMNIST::build()
+bool SampleGraph::build()
 {
     auto builder = SampleUniquePtr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(sample::gLogger.getTRTLogger()));
     if (!builder)
@@ -175,7 +200,7 @@ bool SampleOnnxMNIST::build()
 
     ASSERT(network->getNbInputs() == 1);
     mInputDims = network->getInput(0)->getDimensions();
-    ASSERT(mInputDims.nbDims == 4);
+    ASSERT(mInputDims.nbDims == 2);
 
     ASSERT(network->getNbOutputs() == 1);
     mOutputDims = network->getOutput(0)->getDimensions();
@@ -192,7 +217,7 @@ bool SampleOnnxMNIST::build()
 //!
 //! \param builder Pointer to the engine builder
 //!
-bool SampleOnnxMNIST::constructNetwork(SampleUniquePtr<nvinfer1::IBuilder>& builder,
+bool SampleGraph::constructNetwork(SampleUniquePtr<nvinfer1::IBuilder>& builder,
     SampleUniquePtr<nvinfer1::INetworkDefinition>& network, SampleUniquePtr<nvinfer1::IBuilderConfig>& config,
     SampleUniquePtr<nvonnxparser::IParser>& parser, SampleUniquePtr<nvinfer1::ITimingCache>& timingCache)
 {
@@ -235,7 +260,7 @@ bool SampleOnnxMNIST::constructNetwork(SampleUniquePtr<nvinfer1::IBuilder>& buil
 //! \details This function is the main execution function of the sample. It allocates the buffer,
 //!          sets inputs and executes the engine.
 //!
-bool SampleOnnxMNIST::infer()
+bool SampleGraph::infer()
 {
     // Create RAII buffer manager object
     samplesCommon::BufferManager buffers(mEngine);
@@ -283,32 +308,24 @@ bool SampleOnnxMNIST::infer()
 //!
 //! \brief Reads the input and stores the result in a managed buffer
 //!
-bool SampleOnnxMNIST::processInput(const samplesCommon::BufferManager& buffers)
+bool SampleGraph::processInput(const samplesCommon::BufferManager& buffers)
 {
-    const int inputH = mInputDims.d[2];
-    const int inputW = mInputDims.d[3];
-
-    // Read a random digit file
-    srand(unsigned(time(nullptr)));
-    std::vector<uint8_t> fileData(inputH * inputW);
-    mNumber = rand() % 10;
-    samplesCommon::readPGMFile(
-        samplesCommon::locateFile(std::to_string(mNumber) + ".pgm", mParams.dataDirs), fileData.data(), inputH, inputW);
-
-    // Print an ascii representation
-    sample::gLogInfo << "Input:" << std::endl;
-    for (int i = 0; i < inputH * inputW; i++)
-    {
-        sample::gLogInfo << (" .:-=+*#%@"[fileData[i] / 26]) << (((i + 1) % inputW) ? "" : "\n");
-    }
-    sample::gLogInfo << std::endl;
+    const int inputM = mInputDims.d[0];
+    const int inputK = mInputDims.d[1];
 
     float* hostDataBuffer = static_cast<float*>(buffers.getHostBuffer(mParams.inputTensorNames[0]));
-    for (int i = 0; i < inputH * inputW; i++)
+    int idx = 0;
+    for (int i = 0; i < inputM; i++)
     {
-        hostDataBuffer[i] = 1.0 - float(fileData[i] / 255.0);
+        for (int j = 0; j < inputK; j++)
+        {
+            hostDataBuffer[idx] = idx;
+            ++idx;
+        }
     }
-
+    sample::gLogInfo << "Input: ";
+    printMatrix(hostDataBuffer, inputM, inputK);
+    sample::gLogInfo << std::endl;
     return true;
 }
 
@@ -317,39 +334,15 @@ bool SampleOnnxMNIST::processInput(const samplesCommon::BufferManager& buffers)
 //!
 //! \return whether the classification output matches expectations
 //!
-bool SampleOnnxMNIST::verifyOutput(const samplesCommon::BufferManager& buffers)
+bool SampleGraph::verifyOutput(const samplesCommon::BufferManager& buffers)
 {
-    const int outputSize = mOutputDims.d[1];
+    const int outputM = mOutputDims.d[0];
+    const int outputN = mOutputDims.d[1];
     float* output = static_cast<float*>(buffers.getHostBuffer(mParams.outputTensorNames[0]));
-    float val{0.0F};
-    int idx{0};
-
-    // Calculate Softmax
-    float sum{0.0F};
-    for (int i = 0; i < outputSize; i++)
-    {
-        output[i] = exp(output[i]);
-        sum += output[i];
-    }
-
-    sample::gLogInfo << "Output:" << std::endl;
-    for (int i = 0; i < outputSize; i++)
-    {
-        output[i] /= sum;
-        val = std::max(val, output[i]);
-        if (val == output[i])
-        {
-            idx = i;
-        }
-
-        sample::gLogInfo << " Prob " << i << "  " << std::fixed << std::setw(5) << std::setprecision(4) << output[i]
-                         << " "
-                         << "Class " << i << ": " << std::string(int(std::floor(output[i] * 10 + 0.5F)), '*')
-                         << std::endl;
-    }
+    sample::gLogInfo << "Output: ";
+    printMatrix(output, outputM, outputN);
     sample::gLogInfo << std::endl;
-
-    return idx == mNumber && val > 0.9F;
+    return true;
 }
 
 //!
@@ -358,24 +351,11 @@ bool SampleOnnxMNIST::verifyOutput(const samplesCommon::BufferManager& buffers)
 samplesCommon::OnnxSampleParams initializeSampleParams(const samplesCommon::Args& args)
 {
     samplesCommon::OnnxSampleParams params;
-    if (args.dataDirs.empty()) // Use default directories if user hasn't provided directory paths
-    {
-        params.dataDirs.push_back("data/mnist/");
-        params.dataDirs.push_back("data/samples/mnist/");
-    }
-    else // Use the data directory provided by the user
-    {
-        params.dataDirs = args.dataDirs;
-    }
-    params.onnxFileName = "mnist.onnx";
-    params.inputTensorNames.push_back("Input3");
-    params.outputTensorNames.push_back("Plus214_Output_0");
-    params.dlaCore = args.useDLACore;
-    params.int8 = args.runInInt8;
-    params.fp16 = args.runInFp16;
-    params.bf16 = args.runInBf16;
-    params.timingCacheFile = args.timingCacheFile;
-
+    ASSERT(!args.dataDirs.empty());
+    params.dataDirs = args.dataDirs;
+    params.onnxFileName = "model.onnx";
+    params.inputTensorNames.push_back("x");
+    params.outputTensorNames.push_back("y");
     return params;
 }
 
@@ -384,22 +364,9 @@ samplesCommon::OnnxSampleParams initializeSampleParams(const samplesCommon::Args
 //!
 void printHelpInfo()
 {
-    std::cout
-        << "Usage: ./sample_onnx_mnist [-h or --help] [-d or --datadir=<path to data directory>] [--useDLACore=<int>]"
-        << "[-t or --timingCacheFile=<path to timing cache file]" << std::endl;
+    std::cout << "Usage: ./sample_graph [-h or --help] [-d or --datadir=<path to data directory>]" << std::endl;
     std::cout << "--help             Display help information" << std::endl;
-    std::cout << "--datadir          Specify path to a data directory, overriding the default. This option can be used "
-                 "multiple times to add multiple directories. If no data directories are given, the default is to use "
-                 "(data/samples/mnist/, data/mnist/)"
-              << std::endl;
-    std::cout << "--useDLACore=N     Specify a DLA engine for layers that support DLA. Value can range from 0 to n-1, "
-                 "where n is the number of DLA engines on the platform."
-              << std::endl;
-    std::cout << "--int8             Run in Int8 mode." << std::endl;
-    std::cout << "--fp16             Run in FP16 mode." << std::endl;
-    std::cout << "--bf16             Run in BF16 mode." << std::endl;
-    std::cout << "--timingCacheFile  Specify path to a timing cache file. If it does not already exist, it will be "
-              << "created." << std::endl;
+    std::cout << "--datadir          Specify path to a data directory." << std::endl;
 }
 
 int main(int argc, char** argv)
@@ -422,9 +389,9 @@ int main(int argc, char** argv)
 
     sample::gLogger.reportTestStart(sampleTest);
 
-    SampleOnnxMNIST sample(initializeSampleParams(args));
+    SampleGraph sample(initializeSampleParams(args));
 
-    sample::gLogInfo << "Building and running a GPU inference engine for Onnx MNIST" << std::endl;
+    sample::gLogInfo << "Building and running a GPU inference engine for model.onnx" << std::endl;
 
     if (!sample.build())
     {

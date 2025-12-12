@@ -7,3 +7,8 @@ build/
 *.vcxproj
 externals/
 **/.DS_Store
+run/
+.vim
+.tags
+build.sh
+compile_commands.json
