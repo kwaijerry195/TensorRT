@@ -125,9 +125,14 @@ private:
         SampleUniquePtr<nvonnxparser::IParser>& parser, SampleUniquePtr<nvinfer1::ITimingCache>& timingCache);
 
     //!
-    //! \brief Reads the input  and stores the result in a managed buffer
+    //! \brief Prepare input and write to ManagedBuffer
     //!
     bool processInput(const samplesCommon::BufferManager& buffers, int idx);
+
+    //!
+    //! \brief Reset ManagedBuffer output for reuse
+    //!
+    bool ResetOutput(BufferPool& buffers);
 
     //!
     //! \brief Classifies digits and verify result
@@ -157,6 +162,132 @@ private:
             sample::gLogInfo << "]";
         }
         sample::gLogInfo << "]";
+    }
+
+    //! \brief Run without graph
+    bool inferNonGraph(BufferPool& buffers, nvinfer1::IExecutionContext* context)
+    {
+        sample::gLogInfo << "inferNonGraph:" << std::endl;
+        for (int32_t i = 0; i < BufferPool::kCapacity; ++i)
+        {
+            auto buffer = buffers.Get();
+            ASSERT(buffer != nullptr);
+            for (int32_t b = 0, e = mEngine->getNbIOTensors(); b < e; b++)
+            {
+                auto const name = mEngine->getIOTensorName(b);
+                context->setTensorAddress(name, buffer->getDeviceBuffer(name));
+            }
+            bool status = context->executeV2(buffer->getDeviceBindings().data());
+            if (!status)
+            {
+                return false;
+            }
+
+            // Memcpy from device output buffers to host output buffers
+            buffer->copyOutputToHost();
+
+            // Verify results
+            if (!verifyOutput(*buffer, i))
+            {
+                return false;
+            }
+            buffers.Put(std::move(buffer));
+        }
+        return true;
+    }
+
+    //! \brief Run with graph, works but slow, due to capture every time because of buffer address changes
+    bool inferGraphSlow(BufferPool& buffers, nvinfer1::IExecutionContext* context)
+    {
+        sample::gLogInfo << "inferGraphSlow:" << std::endl;
+        bool needWarmup = true;
+
+        auto eStream = samplesCommon::makeCudaStream();
+        auto cStream = samplesCommon::makeCudaStream();
+        for (int32_t i = 0; i < BufferPool::kCapacity; ++i)
+        {
+            auto buffer = buffers.Get();
+            ASSERT(buffer != nullptr);
+            for (int32_t b = 0, e = mEngine->getNbIOTensors(); b < e; b++)
+            {
+                auto const name = mEngine->getIOTensorName(b);
+                context->setTensorAddress(name, buffer->getDeviceBuffer(name));
+            }
+            bool status = true;
+            if (needWarmup)
+            {
+                ASSERT(context->enqueueV3(*eStream));
+                CHECK(cudaStreamSynchronize(*eStream));
+                needWarmup = false;
+            }
+            // capture
+            cudaGraph_t graph;
+            cudaGraphExec_t instance;
+            CHECK(cudaStreamBeginCapture(*cStream, cudaStreamCaptureModeGlobal));
+            ASSERT(context->enqueueV3(*cStream));
+            CHECK(cudaStreamEndCapture(*cStream, &graph));
+            CHECK(cudaGraphInstantiate(&instance, graph, 0));
+
+            // run graph
+            CHECK(cudaGraphLaunch(instance, *eStream));
+            // Memcpy from device output buffers to host output buffers
+            buffer->copyOutputToHostAsync(*eStream);
+            CHECK(cudaStreamSynchronize(*eStream));
+
+            // Verify results
+            if (!verifyOutput(*buffer, i))
+            {
+                return false;
+            }
+            buffers.Put(std::move(buffer));
+        }
+        return true;
+    }
+
+    //! \brief Run with graph, fast but now work, due to buffer address changes
+    bool inferGraphFast(BufferPool& buffers, nvinfer1::IExecutionContext* context)
+    {
+        sample::gLogInfo << "inferGraphFast:" << std::endl;
+        bool needWarmup = true;
+        auto eStream = samplesCommon::makeCudaStream();
+        auto cStream = samplesCommon::makeCudaStream();
+        cudaGraph_t graph;
+        cudaGraphExec_t instance;
+        for (int32_t i = 0; i < BufferPool::kCapacity; ++i)
+        {
+            auto buffer = buffers.Get();
+            ASSERT(buffer != nullptr);
+            for (int32_t b = 0, e = mEngine->getNbIOTensors(); b < e; b++)
+            {
+                auto const name = mEngine->getIOTensorName(b);
+                context->setTensorAddress(name, buffer->getDeviceBuffer(name));
+            }
+            bool status = true;
+            if (needWarmup)
+            {
+                ASSERT(context->enqueueV3(*eStream));
+                CHECK(cudaStreamSynchronize(*eStream));
+                // capture onece only at warmup
+                CHECK(cudaStreamBeginCapture(*cStream, cudaStreamCaptureModeGlobal));
+                ASSERT(context->enqueueV3(*cStream));
+                CHECK(cudaStreamEndCapture(*cStream, &graph));
+                CHECK(cudaGraphInstantiate(&instance, graph, 0));
+                needWarmup = false;
+            }
+            // run graph
+            CHECK(cudaGraphLaunch(instance, *eStream));
+            // Memcpy from device output buffers to host output buffers
+            buffer->copyOutputToHostAsync(*eStream);
+            CHECK(cudaStreamSynchronize(*eStream));
+
+            // Verify results
+            if (!verifyOutput(*buffer, i))
+            {
+                return false;
+            }
+            buffers.Put(std::move(buffer));
+        }
+        return true;
     }
 };
 
@@ -323,39 +454,29 @@ bool SampleGraph::infer()
         buffer->copyInputToDevice();
         buffers.Put(buffer);
     }
+    ASSERT(ResetOutput(buffers));
     // run infer
-    for (int32_t i = 0; i < BufferPool::kCapacity; ++i)
+    if (!inferNonGraph(buffers, context.get()))
     {
-        auto buffer = buffers.Get();
-        ASSERT(buffer != nullptr);
-        for (int32_t b = 0, e = mEngine->getNbIOTensors(); b < e; b++)
-        {
-            auto const name = mEngine->getIOTensorName(b);
-            context->setTensorAddress(name, buffer->getDeviceBuffer(name));
-        }
-        bool status = context->executeV2(buffer->getDeviceBindings().data());
-        if (!status)
-        {
-            return false;
-        }
-
-        // Memcpy from device output buffers to host output buffers
-        buffer->copyOutputToHost();
-
-        // Verify results
-        if (!verifyOutput(*buffer, i))
-        {
-            return false;
-        }
-        buffers.Put(std::move(buffer));
+        sample::gLogError << "inferNonGraph failed!" << std::endl;
+        return false;
     }
-
+    ASSERT(ResetOutput(buffers));
+    if (!inferGraphSlow(buffers, context.get()))
+    {
+        sample::gLogError << "inferGraphSlow failed!" << std::endl;
+        return false;
+    }
+    ASSERT(ResetOutput(buffers));
+    if (!inferGraphFast(buffers, context.get()))
+    {
+        sample::gLogError << "inferGraphFast failed!" << std::endl;
+        return false;
+    }
+    ASSERT(ResetOutput(buffers));
     return true;
 }
 
-//!
-//! \brief Reads the input and stores the result in a managed buffer
-//!
 bool SampleGraph::processInput(const samplesCommon::BufferManager& buffers, int idx)
 {
     const int inputM = mInputDims.d[0];
@@ -373,6 +494,23 @@ bool SampleGraph::processInput(const samplesCommon::BufferManager& buffers, int 
     sample::gLogInfo << "Input [" << idx << "]: ";
     printMatrix(hostDataBuffer, inputM, inputK);
     sample::gLogInfo << std::endl;
+    return true;
+}
+
+bool SampleGraph::ResetOutput(BufferPool& buffers)
+{
+    const int outputM = mOutputDims.d[0];
+    const int outputK = mOutputDims.d[1];
+    const size_t bytes = sizeof(float) * outputM * outputK;
+    for (int i = 0; i < BufferPool::kCapacity; ++i)
+    {
+        auto buffer = buffers.Get();
+        float* hOutput = static_cast<float*>(buffer->getHostBuffer(mParams.outputTensorNames[0]));
+        float* dOutput = static_cast<float*>(buffer->getDeviceBuffer(mParams.outputTensorNames[0]));
+        CHECK(cudaMemset(dOutput, 0, bytes));
+        CHECK(cudaMemcpy(hOutput, dOutput, bytes, cudaMemcpyDefault));
+        buffers.Put(std::move(buffer));
+    }
     return true;
 }
 
